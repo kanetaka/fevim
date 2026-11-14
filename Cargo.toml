@@ -1,0 +1,30 @@
+[package]
+name = "fevim"
+version = "0.1.0"
+edition = "2024"
+description = "FeVim - a gvim reimplementation in Rust with Lua scripting and a GPUI front end"
+
+[lib]
+name = "fevim"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fevim"
+path = "src/main.rs"
+
+[features]
+default = ["gui"]
+gui = ["dep:gpui"]
+
+[dependencies]
+gpui = { version = "0.2.2", optional = true }
+mlua = { version = "0.11", features = ["lua54", "vendored"] }
+regex = "1"
+unicode-width = "0.2"
+encoding_rs = "0.8"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
