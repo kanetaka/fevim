@@ -1062,7 +1062,7 @@ impl Editor {
         }
     }
 
-    fn visual_simple(&mut self, c: char, rest: &[Key], reg: Option<char>, n: usize) -> Res {
+    pub(super) fn visual_simple(&mut self, c: char, rest: &[Key], reg: Option<char>, n: usize) -> Res {
         let mut r = self.visual_op_range();
         let kind = self.visual_range().unwrap().2;
         match c {

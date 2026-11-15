@@ -11,11 +11,11 @@ use gpui::{
     ExternalPaths, FocusHandle, Focusable, GlobalElementId, Hsla, InspectorElementId, IntoElement, KeyDownEvent, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
     ShapedLine, SharedString, StrikethroughStyle, Style, Task, TextRun, TitlebarOptions, UTF16Selection, UnderlineStyle, Window,
-    WindowBounds, WindowOptions, div, fill, outline, point, prelude::*, px, relative, size,
+    WindowBounds, WindowOptions, anchored, deferred, div, fill, outline, point, prelude::*, px, relative, size,
 };
 
 use crate::editor::highlight::{Attr, Color};
-use crate::editor::mouse::MouseState;
+use crate::editor::mouse::{EditAction, MouseState};
 use crate::editor::screen::{CursorShape, Grid};
 use crate::editor::{Editor, GuiRequest};
 use crate::StartOptions;
@@ -24,6 +24,13 @@ use font::FontSet;
 
 fn hsla(c: Color) -> Hsla {
     gpui::rgb(c.0).into()
+}
+
+/// Blend `a` towards `b` by `t` (0.0 = a, 1.0 = b).
+fn mix(a: Color, b: Color, t: f32) -> Color {
+    let ch = |c: u32, sh: u32| ((c >> sh) & 0xff) as f32;
+    let m = |sh: u32| ((ch(a.0, sh) * (1.0 - t) + ch(b.0, sh) * t).round() as u32).min(255) << sh;
+    Color(m(16) | m(8) | m(0))
 }
 
 fn f(p: Pixels) -> f32 {
@@ -87,6 +94,16 @@ pub struct FeVim {
     lua_timer: Option<Task<()>>,
     guifont: String,
     title: String,
+    /// Right-click popup menu, when open.
+    popup: Option<PopupMenu>,
+}
+
+/// State of the right-click edit menu.
+struct PopupMenu {
+    /// Where the menu opens (window coordinates).
+    pos: Point<Pixels>,
+    /// Cut / Copy / Delete are only enabled with a selection.
+    has_sel: bool,
 }
 
 impl Focusable for FeVim {
@@ -109,6 +126,7 @@ impl FeVim {
             lua_timer: None,
             guifont,
             title: String::new(),
+            popup: None,
         }
     }
 
@@ -239,6 +257,14 @@ impl FeVim {
         if std::env::var("FEVIM_DEBUG_KEYS").is_ok() {
             eprintln!("keydown key={:?} key_char={:?} mods={:?} text={}", ks.key, ks.key_char, ks.modifiers, keymap::is_text_input(ks));
         }
+        // any key closes the popup menu; <Esc> is used up by it
+        if self.popup.take().is_some() {
+            cx.notify();
+            if ks.key == "escape" {
+                cx.stop_propagation();
+                return;
+            }
+        }
         // Printable text is delivered through the input handler (IME aware).
         if keymap::is_text_input(ks) {
             return;
@@ -251,6 +277,10 @@ impl FeVim {
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus);
+        if self.popup.take().is_some() {
+            cx.notify();
+            return;
+        }
         let (row, col) = self.cell_at(ev.position);
         self.sync_clipboard_in(cx);
         let mut ms = self.mouse;
@@ -258,6 +288,93 @@ impl FeVim {
         self.mouse = ms;
         self.ed.after_input();
         self.after_input(window, cx);
+    }
+
+    fn on_right_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
+        self.popup = None;
+        let (row, col) = self.cell_at(ev.position);
+        self.sync_clipboard_in(cx);
+        if self.ed.mouse_right_down(row, col) {
+            self.popup = Some(PopupMenu { pos: ev.position, has_sel: self.ed.has_selection() });
+        }
+        self.ed.after_input();
+        self.after_input(window, cx);
+    }
+
+    /// A popup menu item was chosen.
+    fn popup_action(&mut self, action: EditAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.popup = None;
+        window.focus(&self.focus);
+        self.sync_clipboard_in(cx);
+        self.ed.edit_action(action);
+        self.ed.after_input();
+        self.after_input(window, cx);
+    }
+
+    fn render_popup(&self, menu: &PopupMenu, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // Colours follow the window's Normal colours (the completion Pmenu
+        // group defaults to magenta, which looks out of place here).
+        let nfg = self.ed.hl.normal_fg();
+        let nbg = self.ed.hl.normal_bg();
+        let menu_bg = mix(nbg, nfg, 0.06);
+        let fg = hsla(nfg);
+        let bg = hsla(menu_bg);
+        let border = hsla(mix(nbg, nfg, 0.25));
+        let dim = hsla(mix(menu_bg, nfg, 0.4));
+        // hover uses the selection colour, like the highlighted text
+        let vis = self.ed.hl.attr("Visual");
+        let (sel_bg, sel_fg) = match vis.bg {
+            Some(b) if b != nbg && b != menu_bg => (b, vis.fg.unwrap_or(nfg)),
+            _ => (mix(menu_bg, nfg, 0.18), nfg),
+        };
+        let (sel_bg, sel_fg) = (hsla(sel_bg), hsla(sel_fg));
+        let font = self.fonts.font_for(&Attr::default(), false);
+        let items = [
+            (EditAction::Cut, "切り取り", menu.has_sel),
+            (EditAction::Copy, "コピー", menu.has_sel),
+            (EditAction::Paste, "貼り付け", true),
+            (EditAction::Delete, "削除", menu.has_sel),
+        ];
+        let mut list = div()
+            .id("fevim-popup")
+            .occlude()
+            .flex()
+            .flex_col()
+            .min_w(px(f(self.fonts.cell_w) * 14.0))
+            .py(px(3.))
+            .bg(bg)
+            .text_color(fg)
+            .font(font)
+            .text_size(self.fonts.size)
+            .border_1()
+            .border_color(border)
+            .rounded_md()
+            .shadow_md()
+            .cursor(CursorStyle::Arrow)
+            .on_mouse_down_out(cx.listener(|v, _ev: &MouseDownEvent, _w, cx| {
+                if v.popup.take().is_some() {
+                    cx.notify();
+                }
+            }));
+        for (action, label, enabled) in items {
+            let mut item = div().id(label).mx(px(3.)).px(px(10.)).py(px(3.)).rounded_sm().child(label);
+            if enabled {
+                item = item
+                    .hover(move |s| s.bg(sel_bg).text_color(sel_fg))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |v, _ev: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            v.popup_action(action, window, cx);
+                        }),
+                    );
+            } else {
+                item = item.text_color(dim);
+            }
+            list = list.child(item);
+        }
+        deferred(anchored().position(menu.pos).snap_to_window().child(list)).with_priority(1).into_any_element()
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -307,6 +424,7 @@ impl FeVim {
 impl Render for FeVim {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let bg = hsla(self.ed.hl.normal_bg());
+        let popup = self.popup.as_ref().map(|m| self.render_popup(m, cx));
         div()
             .size_full()
             .bg(bg)
@@ -315,12 +433,14 @@ impl Render for FeVim {
             .cursor(CursorStyle::IBeam)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .on_drop(cx.listener(Self::on_drop))
             .child(GridElement { view: cx.entity() })
+            .children(popup)
     }
 }
 

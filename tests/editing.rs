@@ -229,3 +229,67 @@ fn files_roundtrip() {
     assert_eq!(std::fs::read_to_string(&f).unwrap(), "line1x\r\nline2\r\n");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn popup_menu_edit_actions() {
+    use fevim::editor::mouse::EditAction;
+    // Copy: selection goes to the OS clipboard, text unchanged
+    let mut e = ed("hello world");
+    feed(&mut e, "wve");
+    e.edit_action(EditAction::Copy);
+    assert_eq!(e.clip_out.as_deref(), Some("world"));
+    assert_eq!(text(&e), "hello world");
+    assert_eq!(e.mode, Mode::Normal);
+
+    // Cut: removed from the buffer and put on the clipboard
+    let mut e = ed("hello world");
+    feed(&mut e, "ve");
+    e.edit_action(EditAction::Cut);
+    assert_eq!(e.clip_out.as_deref(), Some("hello"));
+    assert_eq!(text(&e), " world");
+
+    // linewise cut ends with a newline on the clipboard
+    let mut e = ed("a\nb\nc");
+    feed(&mut e, "jV");
+    e.edit_action(EditAction::Cut);
+    assert_eq!(e.clip_out.as_deref(), Some("b\n"));
+    assert_eq!(text(&e), "a\nc");
+
+    // Delete: removed without touching the clipboard
+    let mut e = ed("hello world");
+    e.clip_in = Some("keep".into());
+    feed(&mut e, "ve");
+    e.edit_action(EditAction::Delete);
+    assert_eq!(e.clip_out, None);
+    assert_eq!(text(&e), " world");
+
+    // Paste in normal mode inserts before the cursor
+    let mut e = ed("hello world");
+    e.clip_in = Some("XY".into());
+    feed(&mut e, "w");
+    e.edit_action(EditAction::Paste);
+    assert_eq!(text(&e), "hello XYworld");
+
+    // Paste over a selection replaces it and keeps the clipboard
+    let mut e = ed("hello world");
+    e.clip_in = Some("XY".into());
+    feed(&mut e, "wve");
+    e.edit_action(EditAction::Paste);
+    assert_eq!(text(&e), "hello XY");
+    assert_eq!(e.clip_out, None);
+
+    // Paste in insert mode
+    let mut e = ed("ab");
+    e.clip_in = Some("12".into());
+    feed(&mut e, "a");
+    e.edit_action(EditAction::Paste);
+    feed(&mut e, "<Esc>");
+    assert_eq!(text(&e), "a12b");
+
+    // without a selection Cut / Copy / Delete do nothing
+    let mut e = ed("hello");
+    e.edit_action(EditAction::Cut);
+    e.edit_action(EditAction::Delete);
+    assert_eq!(text(&e), "hello");
+    assert_eq!(e.clip_out, None);
+}

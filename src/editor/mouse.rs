@@ -2,7 +2,8 @@
 
 use super::buffer::Pos;
 use super::motion::{col_at_vcol, last_char_start};
-use super::{Editor, Mode, VisualKind, WinId};
+use super::normal::Op;
+use super::{Editor, Mode, RegKind, VisualKind, WinId};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct MouseState {
@@ -11,6 +12,15 @@ pub struct MouseState {
     pub win: Option<WinId>,
     /// Dragging a status line / vertical separator: (window, vertical).
     pub resizing: Option<(WinId, bool)>,
+}
+
+/// Commands of the right-click popup menu.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EditAction {
+    Cut,
+    Copy,
+    Paste,
+    Delete,
 }
 
 impl Editor {
@@ -256,6 +266,98 @@ impl Editor {
         } else {
             self.scroll_lines(lines);
         }
+    }
+
+    /// Right button pressed: prepare for the popup menu. Keeps a visual
+    /// selection, otherwise moves the cursor to the clicked cell (like
+    /// 'mousemodel' "popup_setpos"). Returns true when the menu should open.
+    pub fn mouse_right_down(&mut self, row: usize, col: usize) -> bool {
+        if !self.mouse_enabled() || self.cmdline.is_some() {
+            return false;
+        }
+        if !self.output.is_empty() {
+            self.output.clear();
+            return false;
+        }
+        let Some((id, false)) = self.window_at(row, col) else {
+            return false;
+        };
+        let pos = self.screen_to_pos(id, row, col);
+        if matches!(self.mode, Mode::Visual(_)) {
+            let inside = id == self.cur_win_id()
+                && self.visual_range().is_some_and(|(s, e, kind)| match kind {
+                    VisualKind::Line | VisualKind::Block => pos.line >= s.line && pos.line <= e.line,
+                    VisualKind::Char => pos >= s && pos <= e,
+                });
+            if inside {
+                return true;
+            }
+            self.exit_visual();
+        }
+        if id != self.cur_win_id() {
+            self.goto_window(id);
+        }
+        if matches!(self.mode, Mode::Insert | Mode::Replace) {
+            let cur = self.cursor();
+            self.buf_mut().close_undo(cur);
+            self.set_cursor(pos);
+            self.buf_mut().undo_cursor = pos;
+            self.ins.start = pos;
+        } else {
+            self.pending.clear();
+            self.set_cursor(pos);
+        }
+        self.update_curswant();
+        self.check_cursor();
+        self.scroll_to_cursor();
+        true
+    }
+
+    /// True when there is a selection the popup menu can cut / copy / delete.
+    pub fn has_selection(&self) -> bool {
+        matches!(self.mode, Mode::Visual(_))
+    }
+
+    /// Run a popup-menu edit command. Cut / Copy / Paste go through the
+    /// clipboard register `+`; Delete uses the black hole register so the
+    /// clipboard is left alone.
+    pub fn edit_action(&mut self, action: EditAction) {
+        let visual = self.has_selection();
+        match action {
+            EditAction::Cut | EditAction::Copy | EditAction::Delete => {
+                if !visual {
+                    return;
+                }
+                let r = self.visual_op_range();
+                self.exit_visual();
+                let (op, reg) = match action {
+                    EditAction::Cut => (Op::Delete, '+'),
+                    EditAction::Copy => (Op::Yank, '+'),
+                    _ => (Op::Delete, '_'),
+                };
+                self.apply_operator(op, r, Some(reg), 1);
+            }
+            EditAction::Paste => {
+                if visual {
+                    // replace the selection, keeping the clipboard unchanged
+                    self.visual_simple('P', &[], Some('+'), 1);
+                    return;
+                }
+                let Some(r) = self.reg_get('+') else {
+                    return;
+                };
+                match self.mode {
+                    Mode::Insert | Mode::Replace => {
+                        let text = if r.kind == RegKind::Line { format!("{}\n", r.text) } else { r.text };
+                        self.insert_text_at_cursor(&text);
+                    }
+                    Mode::Normal => self.put_register(r, true, 1, true),
+                    _ => {}
+                }
+            }
+        }
+        self.check_cursor();
+        self.scroll_to_cursor();
     }
 
     fn update_curswant(&mut self) {
