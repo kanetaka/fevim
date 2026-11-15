@@ -3,6 +3,7 @@ name = "fevim"
 version = "0.1.0"
 edition = "2024"
 description = "FeVim - a gvim reimplementation in Rust with Lua scripting and a GPUI front end"
+license = "MIT"
 
 [lib]
 name = "fevim"
